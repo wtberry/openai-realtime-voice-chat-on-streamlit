@@ -21,10 +21,10 @@ from st_utils import get_logger, get_event_loop
 logger = get_logger(__name__)
 
 
-# Configuration for calling Realtime API
-REALTIME_API_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+# Configuration for calling Azure OpenAI Realtime API
+REALTIME_API_URL = "wss://{endpoint}/openai/realtime?api-version=2024-10-01-preview&deployment={deployment_name}"
 REALTIME_API_HEADERS = {
-    'OpenAI-Beta': 'realtime=v1',
+    'api-key': None,  # Will be set from secrets
 }
 REALTIME_API_CONFIG = dict(
     modalities = ['text', 'audio'],
@@ -86,16 +86,19 @@ class OpenAIRealtimeAPIWrapper:
     def __init__(
         self,
         api_key: str,
+        api_url: str,
         session_timeout: int | float = 60,
         send_interval: float = 0.2
     ):
         """
         Args:
-            api_key (str): OpenAI API key
+            api_key (str): Azure OpenAI API key
+            api_url (str): Azure OpenAI endpoint URL
             session_timeout (int | float): Voice chat session timeout duration (seconds)
             send_interval (float): Interval for sending voice data (seconds)
         """
         self._api_key = api_key
+        self._api_url = api_url
         self._session_timeout = session_timeout
         self._send_interval = send_interval
 
@@ -150,7 +153,7 @@ class OpenAIRealtimeAPIWrapper:
         return new_frame
 
     async def run(self):
-        """Start connection with OpenAI Realtime API and handle audio data transmission
+        """Start connection with Azure OpenAI Realtime API and handle audio data transmission
         """
         if self.recording:
             logger.warning('Already recording')
@@ -159,13 +162,12 @@ class OpenAIRealtimeAPIWrapper:
         self.start()
 
         async with websockets.connect(
-            REALTIME_API_URL,
+            self._api_url,
             additional_headers = {
-                'Authorization': f"Bearer {self._api_key}",
-                **REALTIME_API_HEADERS
+                'api-key': self._api_key
             }
         ) as websocket:
-            logger.info('Connected to OpenAI Realtime API')
+            logger.info('Connected to Azure OpenAI Realtime API')
             await self.configure(websocket)
             logger.info('Configured')
 
@@ -182,7 +184,7 @@ class OpenAIRealtimeAPIWrapper:
         logger.info('Connection closed')
 
     async def configure(self, websocket: 'websockets.asyncio.client.ClientConnection'):
-        """Send session configuration to OpenAI Realtime API
+        """Send session configuration to Azure OpenAI Realtime API
 
         Args:
             websocket (websockets.asyncio.client.ClientConnection): WebSocket client
@@ -193,7 +195,7 @@ class OpenAIRealtimeAPIWrapper:
         )))
 
     async def send(self, websocket: 'websockets.asyncio.client.ClientConnection'):
-        """Send audio data to OpenAI Realtime API
+        """Send audio data to Azure OpenAI Realtime API
 
         Args:
             websocket (websockets.asyncio.client.ClientConnection): WebSocket client
@@ -214,7 +216,7 @@ class OpenAIRealtimeAPIWrapper:
                     type = 'input_audio_buffer.append',
                     audio = base64_audio
                 )))
-                logger.debug('Sent audio to OpenAI (%d bytes)', len(pcm_audio))
+                logger.debug('Sent audio to Azure OpenAI (%d bytes)', len(pcm_audio))
             except Exception as e:
                 logger.error('Error in send loop', exc_info = e)
                 st.exception(e)
@@ -222,7 +224,7 @@ class OpenAIRealtimeAPIWrapper:
         raise TerminateTaskGroup('send')
 
     async def receive(self, websocket: 'websockets.asyncio.client.ClientConnection'):
-        """Receive responses from OpenAI Realtime API
+        """Receive responses from Azure OpenAI Realtime API
 
         Args:
             websocket (websockets.asyncio.client.ClientConnection): WebSocket client
@@ -253,7 +255,7 @@ class OpenAIRealtimeAPIWrapper:
                             assert not _rest
                             self._play_stream.write(resampled_frame)
                             logger.debug(
-                                'Event: %s - received audio from OpenAI (%d bytes)',
+                                'Event: %s - received audio from Azure OpenAI (%d bytes)',
                                 response_data['type'],
                                 len(pcm_audio)
                             )
@@ -410,9 +412,21 @@ def main():
     api_wrapper_key = f"api_wrapper-{hash_by_code(OpenAIRealtimeAPIWrapper)}"
 
     if api_wrapper_key not in st.session_state:
-        openai_api_key = st.secrets['OPENAI_API_KEY']
-        st.session_state[api_wrapper_key] = \
-                OpenAIRealtimeAPIWrapper(api_key = openai_api_key)
+        azure_endpoint = st.secrets['AZURE_OPENAI_ENDPOINT'].rstrip('/')
+        azure_api_key = st.secrets['AZURE_OPENAI_KEY']
+        azure_deployment = st.secrets['AZURE_DEPLOYMENT_NAME']
+        
+        # Construct the full URL with the endpoint and deployment
+        api_url = REALTIME_API_URL.format(
+            endpoint=azure_endpoint.replace('https://', ''),
+            deployment_name=azure_deployment
+        )
+        
+        # Create API wrapper with Azure configuration
+        st.session_state[api_wrapper_key] = OpenAIRealtimeAPIWrapper(
+            api_key=azure_api_key,
+            api_url=api_url
+        )
     api_wrapper = st.session_state[api_wrapper_key]
 
     session_timeout = st.slider(
@@ -449,11 +463,11 @@ def main():
 
     if webrtc_ctx.state.playing:
         if not api_wrapper.recording:
-            st.write('Connecting to OpenAI.')
+            st.write('Connecting to Azure OpenAI.')
             logger.info('Starting running')
             loop.run_until_complete(api_wrapper.run())
             logger.info('Finished running')
-            st.write('Disconnected from OpenAI.')
+            st.write('Disconnected from Azure OpenAI.')
             st.session_state.recording = False
             st.rerun()
     else:
