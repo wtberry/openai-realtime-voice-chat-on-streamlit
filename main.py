@@ -21,6 +21,39 @@ from utils import (
 from st_utils import get_logger, get_event_loop
 
 
+def decode_unicode_escapes(s: str) -> str:
+    """Decode Unicode escape sequences in string.
+    
+    Args:
+        s (str): String containing Unicode escape sequences
+    Returns:
+        str: Decoded string with proper Unicode characters
+    """
+    try:
+        if isinstance(s, str):
+            return s.encode('utf-8').decode('unicode-escape').encode('latin1').decode('utf-8')
+        return s
+    except Exception:
+        return s
+
+
+def decode_json_strings(obj):
+    """Recursively decode all string values in a JSON object.
+    
+    Args:
+        obj: JSON object (dict, list, or primitive type)
+    Returns:
+        Decoded JSON object with proper Unicode characters
+    """
+    if isinstance(obj, dict):
+        return {k: decode_json_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [decode_json_strings(item) for item in obj]
+    elif isinstance(obj, str):
+        return decode_unicode_escapes(obj)
+    return obj
+
+
 logger = get_logger(__name__)
 
 
@@ -88,13 +121,18 @@ class AzureOpenAIRealtimeAPIWrapper:
     _resampler_for_client: av.audio.resampler.AudioResampler
     _record_stream: av.audio.fifo.AudioFifo
     _play_stream: av.audio.fifo.AudioFifo
+    _connection_state: str
+    _max_retries: int
+    _retry_delay: float
 
     def __init__(
         self,
         api_key: str,
         api_url: str,
         session_timeout: int | float = 60,
-        send_interval: float = 0.2
+        send_interval: float = 0.2,
+        max_retries: int = 3,
+        retry_delay: float = 1.0
     ):
         """
         Args:
@@ -107,9 +145,12 @@ class AzureOpenAIRealtimeAPIWrapper:
         self._api_url = api_url
         self._session_timeout = session_timeout
         self._send_interval = send_interval
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
 
         self._recording = False
         self._messages = []
+        self._connection_state = "disconnected"
         self._resampler_for_api = av.audio.resampler.AudioResampler(
             format = FORMAT_MAPPING[API_SAMPLE_WIDTH],
             layout = LAYOUT_MAPPING[API_CHANNELS],
@@ -189,6 +230,20 @@ class AzureOpenAIRealtimeAPIWrapper:
                 logger.error('Error in task group', exc_info = eg)
         logger.info('Connection closed')
 
+    def _sanitize_tool_name(self, name: str) -> str:
+        """Sanitize tool name to match Azure OpenAI API requirements.
+        Only allows alphanumeric characters, underscores, and hyphens.
+
+        Args:
+            name (str): Original tool name
+        Returns:
+            str: Sanitized tool name
+        """
+        import re
+        # Replace any non-allowed characters with underscore
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+        return sanitized
+
     async def configure(self, websocket: 'websockets.asyncio.client.ClientConnection'):
         """Send session configuration to Azure OpenAI Realtime API
 
@@ -198,7 +253,14 @@ class AzureOpenAIRealtimeAPIWrapper:
         # Get tools from MCP client
         mcp_tools = []
         if st.session_state.mcp_client and st.session_state.mcp_client.is_connected:
-            mcp_tools = st.session_state.mcp_client.get_tools()
+            raw_tools = st.session_state.mcp_client.get_tools()
+            # Sanitize tool names
+            mcp_tools = []
+            for tool in raw_tools:
+                sanitized_tool = tool.copy()
+                sanitized_tool['name'] = self._sanitize_tool_name(tool['name'])
+                mcp_tools.append(sanitized_tool)
+            logger.debug('Sanitized tool names: %s', [t['name'] for t in mcp_tools])
 
         # Create config with MCP tools
         config = REALTIME_API_CONFIG.copy()
@@ -207,7 +269,7 @@ class AzureOpenAIRealtimeAPIWrapper:
         await websocket.send(json.dumps(dict(
             type = 'session.update',
             session = config,
-        )))
+        ), ensure_ascii=False))
 
     async def send(self, websocket: 'websockets.asyncio.client.ClientConnection'):
         """Send audio data to Azure OpenAI Realtime API
@@ -230,7 +292,7 @@ class AzureOpenAIRealtimeAPIWrapper:
                 await websocket.send(json.dumps(dict(
                     type = 'input_audio_buffer.append',
                     audio = base64_audio
-                )))
+                ), ensure_ascii=False))
                 logger.debug('Sent audio to Azure OpenAI (%d bytes)', len(pcm_audio))
             except Exception as e:
                 logger.error('Error in send loop', exc_info = e)
@@ -248,8 +310,11 @@ class AzureOpenAIRealtimeAPIWrapper:
         message = None
         user_transcript_placeholder = None
         user_message = None
-        while True:
+        retry_count = 0
+
+        while retry_count < self._max_retries:
             try:
+                self._connection_state = "connected"
                 response = await websocket.recv()
                 if response:
                     response_data = json.loads(response)
@@ -279,9 +344,13 @@ class AzureOpenAIRealtimeAPIWrapper:
                         # logger.debug('Event: %s', response_data['type'])  # Skipped as it occurs too frequently
                         if not message:
                             transcript_placeholder = st.empty()
-                            message = dict(role = 'assistant', content = '')
+                            message = dict(
+                                role = 'assistant',
+                                content = '',
+                                tool_calls = []
+                            )
                             self._messages.append(message)
-                        message['content'] += response_data['delta']
+                        message['content'] += decode_unicode_escapes(response_data['delta'])
                         if not transcript_placeholder:
                             transcript_placeholder = st.empty()
                         with transcript_placeholder.container():
@@ -292,7 +361,7 @@ class AzureOpenAIRealtimeAPIWrapper:
                         logger.info(
                             'Event: %s - %s',
                             response_data['type'],
-                            response_data['transcript']
+                            decode_unicode_escapes(response_data['transcript'])
                         )
                         message = None
                         transcript_placeholder = None
@@ -301,15 +370,15 @@ class AzureOpenAIRealtimeAPIWrapper:
                         logger.debug(
                             'Event: %s - %s',
                             response_data['type'],
-                            response_data['transcript']
+                            decode_unicode_escapes(response_data['transcript'])
                         )
                         if not user_message:
                             user_message = dict(role = 'user', content = '')
                             self._messages.append(user_message)
                         if user_message['content'] is None:
-                            user_message['content'] = response_data['transcript']
+                            user_message['content'] = decode_unicode_escapes(response_data['transcript'])
                         else:
-                            user_message['content'] += response_data['transcript']
+                            user_message['content'] += decode_unicode_escapes(response_data['transcript'])
                         if not user_transcript_placeholder:
                             user_transcript_placeholder = st.empty()
                         with user_transcript_placeholder.container():
@@ -332,9 +401,14 @@ class AzureOpenAIRealtimeAPIWrapper:
                         logger.debug('Event: function call arguments delta')
                         if not message:
                             transcript_placeholder = st.empty()
-                            message = dict(role = 'assistant', content = '')
+                            message = dict(
+                                role = 'assistant',
+                                content = '',
+                                tool_data = '',
+                                tool_calls = []
+                            )
                             self._messages.append(message)
-                        message['content'] += f"[Tool call: {response_data['delta']}]"
+                        message['tool_data'] = message['tool_data'] + decode_unicode_escapes(response_data['delta'])
                         if not transcript_placeholder:
                             transcript_placeholder = st.empty()
                         with transcript_placeholder.container():
@@ -347,33 +421,95 @@ class AzureOpenAIRealtimeAPIWrapper:
                             try:
                                 # Execute the tool call through MCP client
                                 tool_call_id = response_data.get('call_id')
-                                tool_name = response_data.get('name')
+                                # Get original tool name by reversing sanitization if needed
+                                sanitized_name = response_data.get('name')
+                                original_tools = st.session_state.mcp_client.get_tools()
+                                tool_name = next(
+                                    (t['name'] for t in original_tools 
+                                     if self._sanitize_tool_name(t['name']) == sanitized_name),
+                                    sanitized_name  # fallback to sanitized name if not found
+                                )
                                 tool_args = json.loads(response_data.get('arguments', '{}'))
+                                tool_args = decode_json_strings(tool_args)  # Decode any Japanese text in arguments
                                 
-                                # Display tool call info
+                                # Create or update message
                                 if not message:
                                     transcript_placeholder = st.empty()
-                                    message = dict(role = 'assistant', content = '')
+                                    message = dict(
+                                        role = 'assistant',
+                                        content = '',
+                                        tool_data = message.get('tool_data', '') if message else '',
+                                        tool_calls = message.get('tool_calls', []) if message else []
+                                    )
                                     self._messages.append(message)
-                                message['content'] += f"\n\n🛠️ Tool Call:\nName: {tool_name}\nArguments: {json.dumps(tool_args, indent=2)}\n"
-                                if not transcript_placeholder:
-                                    transcript_placeholder = st.empty()
+
+                                # Add tool call to message
+                                message['tool_calls'].append({
+                                    'name': tool_name,
+                                    'arguments': tool_args
+                                })
+
+                                # Display in columns
                                 with transcript_placeholder.container():
-                                    with st.chat_message('assistant'):
-                                        st.write(message['content'])
+                                    cols = st.columns([2, 1])  # 2:1 ratio for main:technical
+                                    
+                                    # Main conversation column
+                                    with cols[0]:
+                                        with st.chat_message('assistant'):
+                                            st.write(message['content'])
+                                    
+                                    # Technical details column
+                                    with cols[1]:
+                                        with st.expander("🛠️ Tool Details", expanded=True):
+                                            for idx, tool_call in enumerate(message['tool_calls']):
+                                                if idx > 0:
+                                                    st.markdown("---")
+                                                st.markdown(f"**Tool Call {idx + 1}**")
+                                                st.json(decode_json_strings(tool_call))
                                 
                                 # Execute the tool call
                                 result = await st.session_state.mcp_client.handle_tool_calls([{
                                     'id': tool_call_id,
                                     'name': tool_name,
-                                    'arguments': json.dumps(tool_args)
+                                    'arguments': json.dumps(tool_args, ensure_ascii=False)
                                 }])
-                                
-                                # Display tool result
-                                message['content'] += f"\n📊 Result:\n{json.dumps(result.get(tool_call_id, ''), indent=2)}\n"
+
+                                # Process and format the result
+                                try:
+                                    result_data = result.get(tool_call_id, '')
+                                    if isinstance(result_data, str):
+                                        try:
+                                            result_data = json.loads(result_data)
+                                            result_data = decode_json_strings(result_data)
+                                        except json.JSONDecodeError:
+                                            result_data = decode_unicode_escapes(result_data)
+                                except Exception as e:
+                                    logger.error('Error processing result', exc_info=e)
+                                    result_data = decode_unicode_escapes(str(result.get(tool_call_id, '')))
+
+                                # Add result to the tool call
+                                message['tool_calls'][-1]['result'] = result_data
+
+                                # Update display with result
                                 with transcript_placeholder.container():
-                                    with st.chat_message('assistant'):
-                                        st.write(message['content'])
+                                    cols = st.columns([2, 1])
+                                    
+                                    # Main conversation column
+                                    with cols[0]:
+                                        with st.chat_message('assistant'):
+                                            st.write(message['content'])
+                                    
+                                    # Technical details column
+                                    with cols[1]:
+                                        with st.expander("🛠️ Tool Details", expanded=True):
+                                            for idx, tool_call in enumerate(message['tool_calls']):
+                                                if idx > 0:
+                                                    st.markdown("---")
+                                                st.markdown(f"**Tool Call {idx + 1}**")
+                                                st.json({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'})
+                                                if 'result' in tool_call:
+                                                    st.markdown("**Result**")
+                                                    st.json(decode_json_strings(tool_call['result']))
                                 
                                 # Submit tool outputs back to Azure OpenAI
                                 if result:
@@ -382,9 +518,9 @@ class AzureOpenAIRealtimeAPIWrapper:
                                         'item': {
                                             'type': 'function_call_output',
                                             'call_id': tool_call_id,
-                                            'output': json.dumps(result.get(tool_call_id, ''))
+                                            'output': json.dumps(result.get(tool_call_id, ''), ensure_ascii=False)
                                         }
-                                    }))
+                                    }, ensure_ascii=False))
                             except Exception as e:
                                 logger.error('Error executing tool call', exc_info=e)
                                 st.error(f"Error executing tool: {str(e)}")
@@ -405,16 +541,29 @@ class AzureOpenAIRealtimeAPIWrapper:
                         )
                     ):
                         # Log content
-                        logger.debug('%s: %s', response_data['type'], response_data)
+                        logger.debug('%s: %s', response_data['type'], decode_json_strings(response_data))
                     else:
                         # Only log event name
                         logger.debug('Event: %s', response_data['type'])
                 else:
                     logger.debug('No response')
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"WebSocket connection closed normally: {e}")
+                break
+            except BrokenPipeError as e:
+                logger.error(f"Connection broken, attempting to reconnect... (attempt {retry_count + 1}/{self._max_retries})")
+                retry_count += 1
+                if retry_count < self._max_retries:
+                    await asyncio.sleep(self._retry_delay)
+                    continue
+                logger.error("Max retries reached, terminating connection")
+                st.error("Connection lost. Please try starting a new conversation.")
+                break
             except Exception as e:
-                logger.error('Error in receive loop', exc_info = e)
+                logger.error('Unexpected error in receive loop', exc_info = e)
                 st.exception(e)
                 break
+        self._connection_state = "disconnected"
         raise TerminateTaskGroup('receive')
 
     async def timer(self):
@@ -437,8 +586,25 @@ class AzureOpenAIRealtimeAPIWrapper:
         """Display chat messages
         """
         for message in self.valid_messages:
-            with st.chat_message(message['role']):
-                st.write(message['content'])
+            cols = st.columns([2, 1])  # 2:1 ratio for main:technical
+            
+            # Main conversation column
+            with cols[0]:
+                with st.chat_message(message['role']):
+                    st.write(message['content'])
+            
+            # Technical details column (only for assistant messages with tool calls)
+            if message['role'] == 'assistant' and message.get('tool_calls'):
+                with cols[1]:
+                    with st.expander("🛠️ Tool Details", expanded=True):
+                        for idx, tool_call in enumerate(message['tool_calls']):
+                            if idx > 0:
+                                st.markdown("---")
+                            st.markdown(f"**Tool Call {idx + 1}**")
+                            st.json({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'})
+                            if 'result' in tool_call:
+                                st.markdown("**Result**")
+                                st.json(decode_json_strings(tool_call['result']))
 
     @property
     def recording(self) -> bool:
@@ -502,20 +668,13 @@ def main():
                 st.session_state.mcp_client = mcp_client
                 logger.info('MCP client initialized')
                 
-                # Try to connect to servers sequentially
-                for server_name in ['slack', 'filesystem']:
-                    if server_name in mcp_client.server_configs:
-                        try:
-                            # Create a new event loop for each server connection
-                            await mcp_client.connect_to_server(server_name)
-                            logger.info(f'Connected to {server_name} MCP server')
-                            # Break after first successful connection
-                            break
-                        except Exception as e:
-                            logger.error(f'Failed to connect to {server_name} MCP server', exc_info=e)
-                            st.error(f'Failed to connect to {server_name} MCP server: {str(e)}')
-                            # Close the client on failure before trying next server
-                            await mcp_client.close()
+                try:
+                    # Initialize all servers in parallel
+                    await mcp_client.initialize()
+                    logger.info('All MCP servers initialized')
+                except Exception as e:
+                    logger.error('Failed to initialize MCP servers', exc_info=e)
+                    st.error(f'Failed to initialize MCP servers: {str(e)}')
             
             # Run server initialization in the event loop
             loop.run_until_complete(initialize_servers())
@@ -529,24 +688,21 @@ def main():
         st.sidebar.markdown("### MCP Server Status")
         
         # For each server in the config
-        for server_name in st.session_state.mcp_client.server_configs.keys():
+        for server_name, server in st.session_state.mcp_client.server_manager.servers.items():
             with st.sidebar.expander(f"🔌 {server_name}"):
                 # Show connection status
-                is_connected = (st.session_state.mcp_client.server_name == server_name and 
-                              st.session_state.mcp_client.is_connected)
-                status_color = "🟢" if is_connected else "🔴"
-                st.markdown(f"{status_color} Status: {'Connected' if is_connected else 'Disconnected'}")
+                status_color = "🟢" if server.connected else "🔴"
+                st.markdown(f"{status_color} Status: {'Connected' if server.connected else 'Disconnected'}")
                 
                 # Show available tools
                 st.markdown("#### Available Tools:")
-                server_tools = st.session_state.mcp_client.tools.get(server_name, {}).values()
-                if server_tools:
-                    for tool in server_tools:
+                if server.tools:
+                    for tool in server.tools.values():
                         st.markdown(f"🛠️ **{tool.name}**")
                         st.markdown(f"_{tool.description}_")
                         with st.container():
                             st.markdown("**Input Schema:**")
-                            st.code(json.dumps(tool.input_schema, indent=2), language="json")
+                            st.code(json.dumps(tool.input_schema, indent=2, ensure_ascii=False), language="json")
                         st.markdown("---")  # Add separator between tools
                 else:
                     st.markdown("*No tools available*")
@@ -568,7 +724,9 @@ def main():
         # Create API wrapper with Azure configuration
         st.session_state[api_wrapper_key] = AzureOpenAIRealtimeAPIWrapper(
             api_key=azure_api_key,
-            api_url=api_url
+            api_url=api_url,
+            max_retries=3,
+            retry_delay=1.0
         )
     api_wrapper = st.session_state[api_wrapper_key]
 
@@ -601,7 +759,7 @@ def main():
         ),
         audio_frame_callback = api_wrapper.audio_frame_callback,
         media_stream_constraints = dict(video = False, audio = True),
-        desired_playing_state = st.session_state.recording,
+        desired_playing_state = st.session_state.recording
     )
 
     if webrtc_ctx.state.playing:
