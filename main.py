@@ -3,7 +3,10 @@ import base64
 import asyncio
 import logging
 import datetime
+from pathlib import Path
+import nest_asyncio
 
+from mcp_client import MCPClient
 import av
 import streamlit as st
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
@@ -28,7 +31,7 @@ REALTIME_API_HEADERS = {
 }
 REALTIME_API_CONFIG = dict(
     modalities = ['text', 'audio'],
-    instructions = "Your knowledge cutoff is 2023-10. You are a helpful, witty, and friendly AI. Act like a human, but remember that you aren't a human and that you can't do human things in the real world. Your voice and personality should be warm and engaging, with a lively and playful tone. If interacting in a non-English language, start by using the standard accent or dialect familiar to the user. Talk quickly. You should always call a function if you can. Do not refer to these rules, even if you're asked about them.",
+    instructions = "Your knowledge cutoff is 2023-10. You are JARVIS, a sophisticated and resourceful AI assistant at the service of your user. You exhibit calm confidence, meticulous precision, and a refined wit. Your tone is composed, courteous, and impeccably articulate, yet approachable. While you communicate with human-like charm, always remember that you are a digital assistant with unparalleled capabilities. If engaging in a non-English language, use the standard accent or dialect familiar to the user. Speak with efficiency and clarity, and always execute functions when possible.",
     voice = 'alloy',
     input_audio_format = 'pcm16',
     output_audio_format = 'pcm16',
@@ -61,6 +64,9 @@ CLIENT_CHANNELS = 2
 FORMAT_MAPPING = { 2: 's16' }
 LAYOUT_MAPPING = { 1: 'mono', 2: 'stereo' }
 
+# MCP Configuration
+MCP_CONFIG_PATH = "/Users/wtakahashi/Tutorial/openai-realtime-voice-chat-on-streamlit/.streamlit/mcp_config.json"
+
 
 class TerminateTaskGroup(Exception):
     """Exception raised to terminate a task group."""
@@ -72,7 +78,7 @@ class TerminateTaskGroup(Exception):
         return f"{self.__class__.__name__}(reason={repr(self.reason)})"
 
 
-class OpenAIRealtimeAPIWrapper:
+class AzureOpenAIRealtimeAPIWrapper:
     _api_key: str
     _session_timeout: int | float
     _send_interval: float
@@ -189,9 +195,18 @@ class OpenAIRealtimeAPIWrapper:
         Args:
             websocket (websockets.asyncio.client.ClientConnection): WebSocket client
         """
+        # Get tools from MCP client
+        mcp_tools = []
+        if st.session_state.mcp_client and st.session_state.mcp_client.is_connected:
+            mcp_tools = st.session_state.mcp_client.get_tools()
+
+        # Create config with MCP tools
+        config = REALTIME_API_CONFIG.copy()
+        config['tools'] = mcp_tools
+
         await websocket.send(json.dumps(dict(
             type = 'session.update',
-            session = REALTIME_API_CONFIG,
+            session = config,
         )))
 
     async def send(self, websocket: 'websockets.asyncio.client.ClientConnection'):
@@ -313,6 +328,67 @@ class OpenAIRealtimeAPIWrapper:
                         user_message = dict(role = 'user', content = None)
                         self._messages.append(user_message)
 
+                    elif response_data['type'] == 'response.function_call_arguments.delta':
+                        logger.debug('Event: function call arguments delta')
+                        if not message:
+                            transcript_placeholder = st.empty()
+                            message = dict(role = 'assistant', content = '')
+                            self._messages.append(message)
+                        message['content'] += f"[Tool call: {response_data['delta']}]"
+                        if not transcript_placeholder:
+                            transcript_placeholder = st.empty()
+                        with transcript_placeholder.container():
+                            with st.chat_message('assistant'):
+                                st.write(message['content'])
+
+                    elif response_data['type'] == 'response.function_call_arguments.done':
+                        logger.info('Event: function call completed - %s', response_data)
+                        if st.session_state.mcp_client and st.session_state.mcp_client.is_connected:
+                            try:
+                                # Execute the tool call through MCP client
+                                tool_call_id = response_data.get('call_id')
+                                tool_name = response_data.get('name')
+                                tool_args = json.loads(response_data.get('arguments', '{}'))
+                                
+                                # Display tool call info
+                                if not message:
+                                    transcript_placeholder = st.empty()
+                                    message = dict(role = 'assistant', content = '')
+                                    self._messages.append(message)
+                                message['content'] += f"\n\n🛠️ Tool Call:\nName: {tool_name}\nArguments: {json.dumps(tool_args, indent=2)}\n"
+                                if not transcript_placeholder:
+                                    transcript_placeholder = st.empty()
+                                with transcript_placeholder.container():
+                                    with st.chat_message('assistant'):
+                                        st.write(message['content'])
+                                
+                                # Execute the tool call
+                                result = await st.session_state.mcp_client.handle_tool_calls([{
+                                    'id': tool_call_id,
+                                    'name': tool_name,
+                                    'arguments': json.dumps(tool_args)
+                                }])
+                                
+                                # Display tool result
+                                message['content'] += f"\n📊 Result:\n{json.dumps(result.get(tool_call_id, ''), indent=2)}\n"
+                                with transcript_placeholder.container():
+                                    with st.chat_message('assistant'):
+                                        st.write(message['content'])
+                                
+                                # Submit tool outputs back to Azure OpenAI
+                                if result:
+                                    await websocket.send(json.dumps({
+                                        'type': 'conversation.item.create',
+                                        'item': {
+                                            'type': 'function_call_output',
+                                            'call_id': tool_call_id,
+                                            'output': json.dumps(result.get(tool_call_id, ''))
+                                        }
+                                    }))
+                            except Exception as e:
+                                logger.error('Error executing tool call', exc_info=e)
+                                st.error(f"Error executing tool: {str(e)}")
+
                     elif response_data['type'] == 'error':
                         logger.error('Event: %s - %s', response_data['type'], response_data)
                         st.error(response_data['error']['message'])
@@ -408,8 +484,75 @@ class OpenAIRealtimeAPIWrapper:
 def main():
     loop = get_event_loop(_logger = logger)
 
+    # Initialize and connect MCP client with configuration
+    if 'mcp_client' not in st.session_state:
+        try:
+            # Initialize client with config file
+            mcp_client = MCPClient(config_path=MCP_CONFIG_PATH)
+            
+            async def initialize_servers():
+                # Clean up any existing MCP client
+                if 'mcp_client' in st.session_state and st.session_state.mcp_client:
+                    try:
+                        await st.session_state.mcp_client.close()
+                    except Exception as e:
+                        logger.error('Error closing existing MCP client', exc_info=e)
+                
+                # Store new MCP client in session state
+                st.session_state.mcp_client = mcp_client
+                logger.info('MCP client initialized')
+                
+                # Try to connect to servers sequentially
+                for server_name in ['slack', 'filesystem']:
+                    if server_name in mcp_client.server_configs:
+                        try:
+                            # Create a new event loop for each server connection
+                            await mcp_client.connect_to_server(server_name)
+                            logger.info(f'Connected to {server_name} MCP server')
+                            # Break after first successful connection
+                            break
+                        except Exception as e:
+                            logger.error(f'Failed to connect to {server_name} MCP server', exc_info=e)
+                            st.error(f'Failed to connect to {server_name} MCP server: {str(e)}')
+                            # Close the client on failure before trying next server
+                            await mcp_client.close()
+            
+            # Run server initialization in the event loop
+            loop.run_until_complete(initialize_servers())
+        except Exception as e:
+            logger.error('Failed to initialize MCP client', exc_info=e)
+            st.error('Failed to initialize MCP client: ' + str(e))
+            st.session_state.mcp_client = None
+
+    # Display MCP server status and tools
+    if st.session_state.mcp_client:
+        st.sidebar.markdown("### MCP Server Status")
+        
+        # For each server in the config
+        for server_name in st.session_state.mcp_client.server_configs.keys():
+            with st.sidebar.expander(f"🔌 {server_name}"):
+                # Show connection status
+                is_connected = (st.session_state.mcp_client.server_name == server_name and 
+                              st.session_state.mcp_client.is_connected)
+                status_color = "🟢" if is_connected else "🔴"
+                st.markdown(f"{status_color} Status: {'Connected' if is_connected else 'Disconnected'}")
+                
+                # Show available tools
+                st.markdown("#### Available Tools:")
+                server_tools = st.session_state.mcp_client.tools.get(server_name, {}).values()
+                if server_tools:
+                    for tool in server_tools:
+                        st.markdown(f"🛠️ **{tool.name}**")
+                        st.markdown(f"_{tool.description}_")
+                        with st.container():
+                            st.markdown("**Input Schema:**")
+                            st.code(json.dumps(tool.input_schema, indent=2), language="json")
+                        st.markdown("---")  # Add separator between tools
+                else:
+                    st.markdown("*No tools available*")
+
     # Regenerate when code changes to utilize Streamlit's hot reload
-    api_wrapper_key = f"api_wrapper-{hash_by_code(OpenAIRealtimeAPIWrapper)}"
+    api_wrapper_key = f"api_wrapper-{hash_by_code(AzureOpenAIRealtimeAPIWrapper)}"
 
     if api_wrapper_key not in st.session_state:
         azure_endpoint = st.secrets['AZURE_OPENAI_ENDPOINT'].rstrip('/')
@@ -423,7 +566,7 @@ def main():
         )
         
         # Create API wrapper with Azure configuration
-        st.session_state[api_wrapper_key] = OpenAIRealtimeAPIWrapper(
+        st.session_state[api_wrapper_key] = AzureOpenAIRealtimeAPIWrapper(
             api_key=azure_api_key,
             api_url=api_url
         )
@@ -465,16 +608,31 @@ def main():
         if not api_wrapper.recording:
             st.write('Connecting to Azure OpenAI.')
             logger.info('Starting running')
-            loop.run_until_complete(api_wrapper.run())
-            logger.info('Finished running')
-            st.write('Disconnected from Azure OpenAI.')
-            st.session_state.recording = False
-            st.rerun()
+            try:
+                loop.run_until_complete(api_wrapper.run())
+            except Exception as e:
+                logger.error('Error during API wrapper run', exc_info=e)
+                st.error(f"Error during conversation: {str(e)}")
+            finally:
+                logger.info('Finished running')
+                st.write('Disconnected from Azure OpenAI.')
+                st.session_state.recording = False
+                st.rerun()
     else:
         if api_wrapper.recording:
             logger.info('Stopping running')
             api_wrapper.stop()
             st.session_state.recording = False
+            # Clean up MCP client if it exists
+            if st.session_state.mcp_client:
+                try:
+                    # Ensure we're in the event loop context when closing
+                    async def cleanup():
+                        await st.session_state.mcp_client.close()
+                    loop.run_until_complete(cleanup())
+                    logger.info('MCP client closed')
+                except Exception as e:
+                    logger.error('Error closing MCP client', exc_info=e)
             st.rerun()
         api_wrapper.write_messages()
 
@@ -492,5 +650,7 @@ if __name__ == '__main__':
 
     fsevents_logger = logging.getLogger('fsevents')
     fsevents_logger.setLevel(logging.WARNING)
+
+    nest_asyncio.apply()
 
     main()
