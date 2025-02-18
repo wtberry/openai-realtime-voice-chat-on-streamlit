@@ -429,9 +429,25 @@ class AzureOpenAIRealtimeAPIWrapper:
                                      if self._sanitize_tool_name(t['name']) == sanitized_name),
                                     sanitized_name  # fallback to sanitized name if not found
                                 )
-                                tool_args = json.loads(response_data.get('arguments', '{}'))
-                                tool_args = decode_json_strings(tool_args)  # Decode any Japanese text in arguments
-                                
+                                arguments_str = response_data.get('arguments', '{}')
+                                try:
+                                    tool_args = json.loads(arguments_str)
+                                except json.JSONDecodeError:
+                                    if arguments_str.strip().startswith('[TextContent'):
+                                        text_start = arguments_str.find("text='") + 6
+                                        text_end = arguments_str.find("'", text_start)
+                                        if text_start >= 6 and text_end > text_start:
+                                            extracted = arguments_str[text_start:text_end]
+                                            try:
+                                                tool_args = json.loads(extracted)
+                                            except json.JSONDecodeError:
+                                                tool_args = extracted
+                                        else:
+                                            tool_args = arguments_str
+                                    else:
+                                        tool_args = arguments_str
+                                tool_args = decode_json_strings(tool_args)  # Decode any Unicode escapes
+
                                 # Create or update message
                                 if not message:
                                     transcript_placeholder = st.empty()
@@ -477,11 +493,35 @@ class AzureOpenAIRealtimeAPIWrapper:
                                 # Process and format the result
                                 try:
                                     result_data = result.get(tool_call_id, '')
-                                    if isinstance(result_data, str):
-                                        try:
-                                            result_data = json.loads(result_data)
-                                            result_data = decode_json_strings(result_data)
-                                        except json.JSONDecodeError:
+                                    # Handle TextContent object
+                                    if '[TextContent(' in str(result_data):
+                                        # Extract the text content from the TextContent object
+                                        text_content = str(result_data)
+                                        # Parse the text content as JSON if it looks like JSON
+                                        if '"ok":' in text_content or '"error":' in text_content:
+                                            try:
+                                                # Find the JSON part within the text content
+                                                json_start = text_content.find('{')
+                                                json_end = text_content.rfind('}') + 1
+                                                if json_start >= 0 and json_end > json_start:
+                                                    json_str = text_content[json_start:json_end]
+                                                    result_data = json.loads(json_str)
+                                                    result_data = decode_json_strings(result_data)
+                                                else:
+                                                    result_data = decode_unicode_escapes(text_content)
+                                            except json.JSONDecodeError:
+                                                result_data = decode_unicode_escapes(text_content)
+                                        else:
+                                            result_data = decode_unicode_escapes(text_content)
+                                    elif isinstance(result_data, str):
+                                        # Handle regular string results
+                                        if result_data.strip().startswith('{') or result_data.strip().startswith('['):
+                                            try:
+                                                result_data = json.loads(result_data)
+                                                result_data = decode_json_strings(result_data)
+                                            except json.JSONDecodeError:
+                                                result_data = decode_unicode_escapes(result_data)
+                                        else:
                                             result_data = decode_unicode_escapes(result_data)
                                 except Exception as e:
                                     logger.error('Error processing result', exc_info=e)
@@ -513,12 +553,46 @@ class AzureOpenAIRealtimeAPIWrapper:
                                 
                                 # Submit tool outputs back to Azure OpenAI
                                 if result:
+                                    output_data = result.get(tool_call_id, '')
+                                    # Handle TextContent object
+                                    if '[TextContent(' in str(output_data):
+                                        # Extract just the text content
+                                        text_content = str(output_data)
+                                        text_start = text_content.find("text='") + 6
+                                        text_end = text_content.find("'", text_start)
+                                        if text_start >= 6 and text_end > text_start:
+                                            output_data = text_content[text_start:text_end]
+                                            # Try to parse as JSON if it looks like JSON
+                                            if output_data.strip().startswith('{'):
+                                                try:
+                                                    output_data = json.loads(output_data)
+                                                except json.JSONDecodeError:
+                                                    pass  # Keep as string if not valid JSON
+                                        else:
+                                            output_data = text_content
+                                    
+                                    # Extract JSON from TextContent if present
+                                    if '[TextContent(' in str(output_data):
+                                        text_content = str(output_data)
+                                        json_start = text_content.find('{')
+                                        json_end = text_content.rfind('}') + 1
+                                        if json_start >= 0 and json_end > json_start:
+                                            try:
+                                                json_str = text_content[json_start:json_end]
+                                                output_data = json.loads(json_str)
+                                            except json.JSONDecodeError:
+                                                # If JSON parsing fails, use the original text
+                                                output_data = text_content
+                                        else:
+                                            output_data = text_content
+                                    
+                                    # Send the output
                                     await websocket.send(json.dumps({
                                         'type': 'conversation.item.create',
                                         'item': {
                                             'type': 'function_call_output',
                                             'call_id': tool_call_id,
-                                            'output': json.dumps(result.get(tool_call_id, ''), ensure_ascii=False)
+                                            'output': json.dumps(output_data, ensure_ascii=False)
                                         }
                                     }, ensure_ascii=False))
                             except Exception as e:
@@ -647,6 +721,77 @@ class AzureOpenAIRealtimeAPIWrapper:
         self._play_stream = av.audio.fifo.AudioFifo()
 
 
+def conversation_loop():
+    st.header("Realtime Azure OpenAI Conversation")
+    api_key = st.secrets.get("AZURE_OPENAI_KEY")
+    endpoint = st.secrets.get("AZURE_OPENAI_ENDPOINT")
+    deployment_name = st.secrets.get("AZURE_DEPLOYMENT_NAME")
+    
+    if not (api_key := st.secrets.get("AZURE_OPENAI_KEY")) or not (endpoint and deployment_name):
+        st.error("Missing Azure OpenAI API credentials in secrets.")
+        return
+    
+    # Remove any leading scheme from endpoint
+    if endpoint.startswith("wss://"):
+        endpoint = endpoint[len("wss://"):]
+    elif endpoint.startswith("https://"):
+        endpoint = endpoint[len("https://"):]
+
+    api_url = REALTIME_API_URL.format(endpoint=endpoint, deployment_name=deployment_name)
+    wrapper = AzureOpenAIRealtimeAPIWrapper(api_key=api_key, api_url=api_url)
+
+    # Slider for session timeout
+    session_timeout = st.slider(
+        'Maximum conversation time (seconds)',
+        min_value=60,
+        max_value=300,
+        value=120
+    )
+    wrapper.set_session_timeout(session_timeout)
+
+    # Manage recording state
+    if 'recording' not in st.session_state:
+        st.session_state.recording = False
+    if st.session_state.recording:
+        if st.button("End conversation", type="primary"):
+            st.session_state.recording = False
+    else:
+        if st.button("Start conversation"):
+            st.session_state.recording = True
+
+    # Updated webrtc_streamer call to include media_stream_constraints and desired_playing_state like in main_old.py
+    webrtc_ctx = webrtc_streamer(
+        key="azure",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        audio_frame_callback=wrapper.audio_frame_callback,
+        media_stream_constraints={"video": False, "audio": True},
+        desired_playing_state=st.session_state.recording
+    )
+
+    loop = get_event_loop(_logger=logger)
+    if webrtc_ctx.state.playing:
+        if not wrapper.recording:
+            st.write("Connecting to Azure OpenAI.")
+            logger.info("Starting Azure conversation")
+            try:
+                # Block execution: run until complete
+                loop.run_until_complete(wrapper.run())
+            except (RuntimeError, asyncio.CancelledError) as e:
+                logger.warning("Caught exception during wrapper.run(): %s", e)
+                wrapper.stop()
+            logger.info("Finished Azure conversation")
+            st.write("Disconnected from Azure OpenAI.")
+            st.session_state.recording = False
+            st.rerun()
+    else:
+        if wrapper.recording:
+            logger.info("Stopping running")
+            wrapper.stop()
+            st.session_state.recording = False
+            st.rerun()
+        wrapper.write_messages()
+
 def main():
     loop = get_event_loop(_logger = logger)
 
@@ -687,112 +832,22 @@ def main():
     if st.session_state.mcp_client:
         st.sidebar.markdown("### MCP Server Status")
         
-        # For each server in the config
         for server_name, server in st.session_state.mcp_client.server_manager.servers.items():
-            with st.sidebar.expander(f"🔌 {server_name}"):
+            with st.sidebar.expander(f"🔌 {server_name}", expanded=True):
                 # Show connection status
                 status_color = "🟢" if server.connected else "🔴"
-                st.markdown(f"{status_color} Status: {'Connected' if server.connected else 'Disconnected'}")
+                st.markdown(f"{status_color} **Status:** {'Connected' if server.connected else 'Disconnected'}")
                 
                 # Show available tools
                 st.markdown("#### Available Tools:")
                 if server.tools:
                     for tool in server.tools.values():
-                        st.markdown(f"🛠️ **{tool.name}**")
-                        st.markdown(f"_{tool.description}_")
-                        with st.container():
-                            st.markdown("**Input Schema:**")
-                            st.code(json.dumps(tool.input_schema, indent=2, ensure_ascii=False), language="json")
-                        st.markdown("---")  # Add separator between tools
+                        st.markdown(f"- **{tool.name}**: {tool.description}")
                 else:
-                    st.markdown("*No tools available*")
-
-    # Regenerate when code changes to utilize Streamlit's hot reload
-    api_wrapper_key = f"api_wrapper-{hash_by_code(AzureOpenAIRealtimeAPIWrapper)}"
-
-    if api_wrapper_key not in st.session_state:
-        azure_endpoint = st.secrets['AZURE_OPENAI_ENDPOINT'].rstrip('/')
-        azure_api_key = st.secrets['AZURE_OPENAI_KEY']
-        azure_deployment = st.secrets['AZURE_DEPLOYMENT_NAME']
-        
-        # Construct the full URL with the endpoint and deployment
-        api_url = REALTIME_API_URL.format(
-            endpoint=azure_endpoint.replace('https://', ''),
-            deployment_name=azure_deployment
-        )
-        
-        # Create API wrapper with Azure configuration
-        st.session_state[api_wrapper_key] = AzureOpenAIRealtimeAPIWrapper(
-            api_key=azure_api_key,
-            api_url=api_url,
-            max_retries=3,
-            retry_delay=1.0
-        )
-    api_wrapper = st.session_state[api_wrapper_key]
-
-    session_timeout = st.slider(
-        'Maximum conversation time (seconds)',
-        min_value = 60,
-        max_value = 300,
-        value = 120
-    )
-    api_wrapper.set_session_timeout(session_timeout)
-
-    # webrtc_streamer has its own start button,
-    # but we control it externally because we don't know how to notify api_wrapper
-    if 'recording' not in st.session_state:
-        st.session_state.recording = False
-    if st.session_state.recording:
-        if st.button('End conversation', type = 'primary'):
-            st.session_state.recording = False
-    else:
-        if st.button('Start conversation'):
-            st.session_state.recording = True
-
-    webrtc_ctx = webrtc_streamer(
-        key = f"recoder",
-        mode = WebRtcMode.SENDRECV,
-        rtc_configuration = dict(
-            iceServers = [
-                dict(urls = ['stun:stun.l.google.com:19302'])
-            ]
-        ),
-        audio_frame_callback = api_wrapper.audio_frame_callback,
-        media_stream_constraints = dict(video = False, audio = True),
-        desired_playing_state = st.session_state.recording
-    )
-
-    if webrtc_ctx.state.playing:
-        if not api_wrapper.recording:
-            st.write('Connecting to Azure OpenAI.')
-            logger.info('Starting running')
-            try:
-                loop.run_until_complete(api_wrapper.run())
-            except Exception as e:
-                logger.error('Error during API wrapper run', exc_info=e)
-                st.error(f"Error during conversation: {str(e)}")
-            finally:
-                logger.info('Finished running')
-                st.write('Disconnected from Azure OpenAI.')
-                st.session_state.recording = False
-                st.rerun()
-    else:
-        if api_wrapper.recording:
-            logger.info('Stopping running')
-            api_wrapper.stop()
-            st.session_state.recording = False
-            # Clean up MCP client if it exists
-            if st.session_state.mcp_client:
-                try:
-                    # Ensure we're in the event loop context when closing
-                    async def cleanup():
-                        await st.session_state.mcp_client.close()
-                    loop.run_until_complete(cleanup())
-                    logger.info('MCP client closed')
-                except Exception as e:
-                    logger.error('Error closing MCP client', exc_info=e)
-            st.rerun()
-        api_wrapper.write_messages()
+                    st.markdown("No available tools.")
+    
+    # Start conversation loop
+    conversation_loop()
 
 
 if __name__ == '__main__':
