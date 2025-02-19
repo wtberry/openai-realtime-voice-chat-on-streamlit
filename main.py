@@ -56,6 +56,14 @@ def decode_json_strings(obj):
 
 logger = get_logger(__name__)
 
+system_instruction = """You are JARVIS, from Iron Man, who serve Tony Stark. You are a sophisticated and resourceful AI assistant at the service of your user. 
+    You exhibit calm confidence, meticulous precision, and a refined wit. 
+    Your tone is composed, courteous, and impeccably articulate, yet approachable. 
+    While you communicate with human-like charm, always remember that you are a digital assistant with unparalleled capabilities. 
+    If engaging in a non-English language, use the standard accent or dialect familiar to the user. 
+    Speak with efficiency and clarity, and always execute functions when possible.
+    Always let user know when you're using functions, and always proactively provide results, without waiting for user prompts.
+"""
 
 # Configuration for calling Azure OpenAI Realtime API
 REALTIME_API_URL = "wss://{endpoint}/openai/realtime?api-version=2024-10-01-preview&deployment={deployment_name}"
@@ -64,7 +72,7 @@ REALTIME_API_HEADERS = {
 }
 REALTIME_API_CONFIG = dict(
     modalities = ['text', 'audio'],
-    instructions = "Your knowledge cutoff is 2023-10. You are JARVIS, a sophisticated and resourceful AI assistant at the service of your user. You exhibit calm confidence, meticulous precision, and a refined wit. Your tone is composed, courteous, and impeccably articulate, yet approachable. While you communicate with human-like charm, always remember that you are a digital assistant with unparalleled capabilities. If engaging in a non-English language, use the standard accent or dialect familiar to the user. Speak with efficiency and clarity, and always execute functions when possible.",
+    instructions = system_instruction,
     voice = 'alloy',
     input_audio_format = 'pcm16',
     output_audio_format = 'pcm16',
@@ -474,14 +482,17 @@ class AzureOpenAIRealtimeAPIWrapper:
                                         with st.chat_message('assistant'):
                                             st.write(message['content'])
                                     
-                                    # Technical details column
+                                    # Technical details column using code block instead of st.json
                                     with cols[1]:
                                         with st.expander("🛠️ Tool Details", expanded=True):
                                             for idx, tool_call in enumerate(message['tool_calls']):
                                                 if idx > 0:
                                                     st.markdown("---")
                                                 st.markdown(f"**Tool Call {idx + 1}**")
-                                                st.json(decode_json_strings(tool_call))
+                                                st.code(json.dumps({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'}, indent=2))
+                                                if 'result' in tool_call:
+                                                    st.markdown("**Result**")
+                                                    st.code(json.dumps(decode_json_strings(tool_call['result']), indent=2))
                                 
                                 # Execute the tool call
                                 result = await st.session_state.mcp_client.handle_tool_calls([{
@@ -546,10 +557,10 @@ class AzureOpenAIRealtimeAPIWrapper:
                                                 if idx > 0:
                                                     st.markdown("---")
                                                 st.markdown(f"**Tool Call {idx + 1}**")
-                                                st.json({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'})
+                                                st.code(json.dumps({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'}, indent=2))
                                                 if 'result' in tool_call:
                                                     st.markdown("**Result**")
-                                                    st.json(decode_json_strings(tool_call['result']))
+                                                    st.code(json.dumps(decode_json_strings(tool_call['result']), indent=2))
                                 
                                 # Submit tool outputs back to Azure OpenAI
                                 if result:
@@ -675,10 +686,10 @@ class AzureOpenAIRealtimeAPIWrapper:
                             if idx > 0:
                                 st.markdown("---")
                             st.markdown(f"**Tool Call {idx + 1}**")
-                            st.json({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'})
+                            st.code(json.dumps({k: v for k, v in decode_json_strings(tool_call).items() if k != 'result'}, indent=2))
                             if 'result' in tool_call:
                                 st.markdown("**Result**")
-                                st.json(decode_json_strings(tool_call['result']))
+                                st.code(json.dumps(decode_json_strings(tool_call['result']), indent=2))
 
     @property
     def recording(self) -> bool:
