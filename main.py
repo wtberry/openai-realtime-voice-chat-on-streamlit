@@ -814,7 +814,7 @@ def main():
             
             async def initialize_servers():
                 # Clean up any existing MCP client
-                if 'mcp_client' in st.session_state and st.session_state.mcp_client:
+                if 'mcp_client' in st.session_state and st.session_state.mcp_client:    
                     try:
                         await st.session_state.mcp_client.close()
                     except Exception as e:
